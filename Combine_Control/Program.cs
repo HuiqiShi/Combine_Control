@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -27,16 +27,18 @@ namespace Combine_Control
         private static double _slowAccel = 0.1;
         private static double _slowVel = 0.1;
 
-        private static double _waitSec = 10.0;
+        private static double _waitAfterHomeSec = 3.0;
+        private static double _waitAtStartSec = 50.0;
 
         // ===== 力触发参数 =====
         private static double _firstTriggerForce = 0.06;
         private static double _forceStep = 0.03;
         private static double _forceStopThreshold = 0.35;
 
-        // ===== 相机序列号 =====
+        // ===== 相机参数 =====
         private const string LEFT_SERIAL = "40241344";
         private const string RIGHT_SERIAL = "40241347";
+        private const double EXPOSURE_US = 16667;
 
         // ===== 线程间共享 =====
         private static volatile bool _motionRunning = true;
@@ -104,7 +106,7 @@ namespace Combine_Control
             usb225.SetChannelXSamplingRate(0, usbRates.First(x => x == _usbSamplingRateHz));
             Console.WriteLine("USB225 sampling rate set to {0} Hz.", _usbSamplingRateHz);
 
-            // ========== 初始化 双目相机 ==========
+            // ========== 初始化 双目相机（曝光16667us + 只取最新帧策略）==========
             Camera leftCamera = null;
             Camera rightCamera = null;
             try
@@ -112,12 +114,25 @@ namespace Combine_Control
                 leftCamera = new Camera(LEFT_SERIAL);
                 leftCamera.CameraOpened += Configuration.AcquireContinuous;
                 leftCamera.Open();
+                leftCamera.Parameters[PLCamera.ExposureTime].SetValue(EXPOSURE_US);
+                leftCamera.Parameters[PLCameraInstance.OutputQueueSize].SetValue(1);   // 只保留最新1帧
+                Console.WriteLine("Left camera opened, exposure = {0} us, frameRate = {1:F2} fps",
+                    leftCamera.Parameters[PLCamera.ExposureTime].GetValue(),
+                    leftCamera.Parameters[PLCamera.ResultingFrameRate].GetValue()); ;
+
                 rightCamera = new Camera(RIGHT_SERIAL);
                 rightCamera.CameraOpened += Configuration.AcquireContinuous;
                 rightCamera.Open();
-                leftCamera.StreamGrabber.Start();
-                rightCamera.StreamGrabber.Start();
-                Console.WriteLine("Both cameras opened and streaming.");
+                rightCamera.Parameters[PLCamera.ExposureTime].SetValue(EXPOSURE_US);
+                rightCamera.Parameters[PLCameraInstance.OutputQueueSize].SetValue(1);  // 只保留最新1帧
+                Console.WriteLine("Right camera opened, exposure = {0} us, frameRate = {1:F2} fps",
+                    rightCamera.Parameters[PLCamera.ExposureTime].GetValue(),
+                    rightCamera.Parameters[PLCamera.ResultingFrameRate].GetValue());
+
+                // 用 LatestImages 策略启动：RetrieveResult 永远取最新帧，旧帧自动丢弃
+                leftCamera.StreamGrabber.Start(GrabStrategy.LatestImages, GrabLoop.ProvidedByUser);
+                rightCamera.StreamGrabber.Start(GrabStrategy.LatestImages, GrabLoop.ProvidedByUser);
+                Console.WriteLine("Both cameras streaming (LatestImages strategy).");
             }
             catch (Exception ex)
             {
@@ -143,8 +158,8 @@ namespace Combine_Control
                 kstDevice.Home(TimeSpan.FromSeconds(60));
                 Console.WriteLine("Homing completed.");
 
-                Console.WriteLine("Waiting {0} s...", _waitSec);
-                Thread.Sleep((int)(_waitSec * 1000));
+                Console.WriteLine("Waiting {0} s after homing...", _waitAfterHomeSec);
+                Thread.Sleep((int)(_waitAfterHomeSec * 1000));
 
                 // ---- 第一段：快速去48mm ----
                 SetVelocity(kstDevice, deviceUnit, _fastAccel, _fastVel);
@@ -153,8 +168,10 @@ namespace Combine_Control
                 kstDevice.Move(MoveMode.Absolute, (int)startInDeviceUnits, TimeSpan.FromSeconds(120));
                 Console.WriteLine("Reached start position.");
 
-                Console.WriteLine("Waiting {0} s before main motion...", _waitSec);
-                Thread.Sleep((int)(_waitSec * 1000));
+                // ---- 到48mm后等待200秒 ----
+                Console.WriteLine("Reached {0} mm. Waiting {1} s for preparation...", _startPositionMm, _waitAtStartSec);
+                Thread.Sleep((int)(_waitAtStartSec * 1000));
+                Console.WriteLine("Preparation wait done. Starting main motion.");
 
                 // ---- 第二段：慢速参数 ----
                 SetVelocity(kstDevice, deviceUnit, _slowAccel, _slowVel);
@@ -172,7 +189,7 @@ namespace Combine_Control
                 Task moveTask = Task.Run(() =>
                 {
                     _sharedStopwatch.Start();
-                    kstDevice.Move(MoveMode.Absolute, (int)targetInDeviceUnits, TimeSpan.FromSeconds(800));
+                    kstDevice.Move(MoveMode.Absolute, (int)targetInDeviceUnits, TimeSpan.FromSeconds(1000));
                 });
 
                 double nextTriggerForce = _firstTriggerForce;
@@ -237,7 +254,7 @@ namespace Combine_Control
                 Console.WriteLine("KST samples: {0}, USB samples: {1}, Camera pairs: {2}",
                     kstLog.Count, usbLog.Count, _capturedPairs.Count);
 
-                // ========== 保存相机图片（快门时刻插值力和位置命名）==========
+                // ========== 保存相机图片 ==========
                 Console.WriteLine("Saving camera images...");
                 foreach (var pair in _capturedPairs)
                 {
@@ -249,10 +266,10 @@ namespace Combine_Control
                     string rightName = string.Format("right_{0:F3}s_{1:F3}lb_{2:F2}mm.png", t, forceAtShutter, posAtShutter);
                     SaveResult(pair.Left, Path.Combine(saveDir, leftName));
                     SaveResult(pair.Right, Path.Combine(saveDir, rightName));
-                    Console.WriteLine("  Shutter @ {0:F3}s -> {1:F3}lb, {2:F2}mm", t, forceAtShutter, posAtShutter);
+                    Console.WriteLine("  Saved: Shutter @ {0:F3}s -> {1:F3}lb, {2:F2}mm", t, forceAtShutter, posAtShutter);
                 }
 
-                // ========== 输出合并 TXT（Time / Force / Position，以力点为基准插值位置）==========
+                // ========== 输出合并 TXT（Time / Force / Position）==========
                 string ts = DateTime.Now.ToString("yyyyMMdd_HHmmss");
                 string mergedPath = Path.Combine(Environment.CurrentDirectory,
                     string.Format("Merged_ForceVsPosition_{0}.txt", ts));
@@ -270,7 +287,6 @@ namespace Combine_Control
                 File.WriteAllText(mergedPath, mergedTxt.ToString());
                 Console.WriteLine("Merged data saved: {0} ({1} points)", mergedPath, mergedCount);
 
-                // 各存一份原始数据
                 SaveRawTxt(kstLog, "KST_Position", ts, "Time(s)\tPosition(mm)");
                 SaveRawTxt(usbLog, "USB_Force", ts, "Time(s)\tForce(lb)");
             }
